@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS API Gateway / Cognito integration for Book Depot API
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: allow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 'logs:*'
+              Resource: arn:aws:logs:*:*:*
+
+  BookDepotLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BookDepotInventoryAPI
+      Runtime: nodejs12.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const response = {
+                statusCode: 200,
+                body: JSON.stringify('Hello from Lambda!'),
+            };
+            return response;
+          };
+
+  BookDepotAPIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: API Endpoint
+      Name: BookDepotAPI
+
+  CognitoAutorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: method.request.header.Authorization
+      Name: BookDepot-userpool-authorizer
+      ProviderARNs:
+        - !ImportValue BookDepotAPIUserPoolArn
+      RestApiId: !Ref BookDepotAPIGateway
+      Type: COGNITO_USER_POOLS
+
+  AuthResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt BookDepotAPIGateway.RootResourceId
+      RestApiId: !Ref BookDepotAPIGateway
+      PathPart: "auth"
+
+  InventoryResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt BookDepotAPIGateway.RootResourceId
+      RestApiId: !Ref BookDepotAPIGateway
+      PathPart: "api"
+
+  AuthSubResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !Ref AuthResource
+      RestApiId: !Ref BookDepotAPIGateway
+      PathPart: "{proxy+}"
+
+  InventorySubResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !Ref InventoryResource
+      RestApiId: !Ref BookDepotAPIGateway
+      PathPart: "{proxy+}"
+
+  RootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: ANY
+      ResourceId: !GetAtt BookDepotAPIGateway.RootResourceId
+      RestApiId: !Ref BookDepotAPIGateway
+      AuthorizationType: NONE
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          StatusCode: 200
+      Integration:
+        IntegrationHttpMethod: ANY
+        Type: MOCK
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: |
+            {"statusCode": 200}
+        TimeoutInMillis: 29000
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              text/plain: "Welcome to Book Depot Public API"
+          - ResponseTemplates:
+              application/json: '{"message": "Internal Server Error"}'
+            SelectionPattern: '5\d{2}'
+            StatusCode: 500
+
+  AuthMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      ResourceId: !Ref AuthSubResource
+      RestApiId: !Ref BookDepotAPIGateway
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        CacheKeyParameters:
+          - "method.request.path.proxy"
+        IntegrationHttpMethod: ANY
+        Type: HTTP_PROXY
+        Uri:
+          Fn::Sub:
+            - https://${APIUserPoolUrl}.auth.${AWS::Region}.amazoncognito.com/{proxy}
+            - APIUserPoolUrl: !ImportValue BookDepotAPIUserPoolUrl
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestParameters:
+          integration.request.path.proxy: "method.request.path.proxy"
+        IntegrationResponses:
+          - StatusCode: 200
+
+  InventoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizationScopes:
+        - InventoryAPI/read
+      AuthorizerId: !Ref CognitoAutorizer
+      HttpMethod: ANY
+      ResourceId: !Ref InventorySubResource
+      RestApiId: !Ref BookDepotAPIGateway
+      RequestParameters:
+        'method.request.path.proxy': true
+        'method.request.header.Authorization': true
+      Integration:
+        CacheKeyParameters:
+          - "method.request.path.proxy"
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt BookDepotLambdaFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+
+  lambdaApiGatewayInvoke:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt BookDepotLambdaFunction.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BookDepotAPIGateway}/*/*/api/*"
+
